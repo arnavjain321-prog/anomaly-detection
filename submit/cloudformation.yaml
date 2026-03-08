@@ -16,6 +16,47 @@ Resources:
   DataBucket:
     Type: AWS::S3::Bucket
 
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: ds5220-dp1
+
+  SNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref SNSTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowS3Publish
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref SNSTopic
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub arn:aws:s3:::${DataBucket}
+
+  DataBucketNotification:
+    Type: AWS::S3::Bucket
+    DependsOn:
+      - SNSTopicPolicy
+    Properties:
+      BucketName: !Ref DataBucket
+      NotificationConfiguration:
+        TopicConfigurations:
+          - Event: s3:ObjectCreated:*
+            Topic: !Ref SNSTopic
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: raw/
+                  - Name: suffix
+                    Value: .csv
+
   EC2Role:
     Type: AWS::IAM::Role
     Properties:
@@ -38,9 +79,15 @@ Resources:
         Statement:
           - Effect: Allow
             Action:
-              - s3:*
+              - s3:ListBucket
             Resource:
               - !Sub arn:aws:s3:::${DataBucket}
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+            Resource:
               - !Sub arn:aws:s3:::${DataBucket}/*
 
   EC2InstanceProfile:
@@ -76,24 +123,51 @@ Resources:
         - DeviceName: /dev/sda1
           Ebs:
             VolumeSize: 16
+            VolumeType: gp3
+            DeleteOnTermination: true
       UserData:
         Fn::Base64: !Sub |
           #!/bin/bash
+          set -e
           apt-get update -y
           apt-get install -y python3 python3-pip python3-venv git
+
           cd /home/ubuntu
           git clone https://github.com/uvasds-systems/anomaly-detection.git
           cd anomaly-detection
+
           python3 -m venv venv
-          source venv/bin/activate
-          pip install -r requirements.txt
-          pip install fastapi uvicorn boto3 pandas scikit-learn
+          /home/ubuntu/anomaly-detection/venv/bin/pip install --upgrade pip
+          /home/ubuntu/anomaly-detection/venv/bin/pip install -r requirements.txt
+          /home/ubuntu/anomaly-detection/venv/bin/pip install fastapi uvicorn boto3 pandas scikit-learn requests
+
           echo "BUCKET_NAME=${DataBucket}" >> /etc/environment
           export BUCKET_NAME=${DataBucket}
-          nohup venv/bin/fastapi run app.py --host 0.0.0.0 --port 8000 &
+
+          cat > /etc/systemd/system/anomaly-api.service <<EOF
+          [Unit]
+          Description=Anomaly Detection FastAPI Service
+          After=network.target
+
+          [Service]
+          User=ubuntu
+          WorkingDirectory=/home/ubuntu/anomaly-detection
+          Environment=BUCKET_NAME=${DataBucket}
+          ExecStart=/home/ubuntu/anomaly-detection/venv/bin/fastapi run app.py --host 0.0.0.0 --port 8000
+          Restart=always
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          systemctl daemon-reload
+          systemctl enable anomaly-api.service
+          systemctl start anomaly-api.service
 
   ElasticIP:
     Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
 
   EIPAssociation:
     Type: AWS::EC2::EIPAssociation
@@ -101,14 +175,29 @@ Resources:
       InstanceId: !Ref EC2Instance
       AllocationId: !GetAtt ElasticIP.AllocationId
 
-  SNSTopic:
-    Type: AWS::SNS::Topic
-    Properties:
-      TopicName: ds5220-dp1
-
   SNSSubscription:
     Type: AWS::SNS::Subscription
+    DependsOn:
+      - EIPAssociation
+      - EC2Instance
     Properties:
       TopicArn: !Ref SNSTopic
       Protocol: http
       Endpoint: !Sub "http://${ElasticIP}:8000/notify"
+
+Outputs:
+  BucketName:
+    Description: S3 bucket used by the anomaly pipeline
+    Value: !Ref DataBucket
+
+  ElasticIPAddress:
+    Description: Public Elastic IP of the EC2 instance
+    Value: !Ref ElasticIP
+
+  InstanceId:
+    Description: EC2 instance ID
+    Value: !Ref EC2Instance
+
+  TopicArn:
+    Description: SNS topic ARN
+    Value: !Ref SNSTopic
