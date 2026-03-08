@@ -97,7 +97,7 @@ Resources:
           apt-get install -y python3 python3-pip python3-venv git
 
           cd /home/ubuntu
-          git clone https://github.com/uvasds-systems/anomaly-detection.git
+          git clone https://github.com/arnavjain321-prog/anomaly-detection.git
           cd anomaly-detection
 
           python3 -m venv venv
