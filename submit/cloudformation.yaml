@@ -1,34 +1,21 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: DS5220 Data Project 1 – Event-driven anomaly detection pipeline
+Description: DS5220 Anomaly Detection Pipeline
 
 Parameters:
-
 KeyName:
 Description: EC2 Key Pair
 Type: AWS::EC2::KeyPair::KeyName
 Default: ds5220-keypair
 
 MyIP:
-Description: Your IP for SSH
+Description: Your IP for SSH access
 Type: String
 Default: 0.0.0.0/0
 
 Resources:
 
-# ----------------------------
-
-# S3 Bucket
-
-# ----------------------------
-
 DataBucket:
 Type: AWS::S3::Bucket
-
-# ----------------------------
-
-# IAM Role for EC2
-
-# ----------------------------
 
 EC2Role:
 Type: AWS::IAM::Role
@@ -63,12 +50,6 @@ Properties:
 Roles:
 - !Ref EC2Role
 
-# ----------------------------
-
-# Security Group
-
-# ----------------------------
-
 InstanceSecurityGroup:
 Type: AWS::EC2::SecurityGroup
 Properties:
@@ -86,22 +67,14 @@ CidrIp: !Ref MyIP
       CidrIp: 0.0.0.0/0
 ```
 
-# ----------------------------
-
-# EC2 Instance
-
-# ----------------------------
-
 EC2Instance:
 Type: AWS::EC2::Instance
 Properties:
+InstanceType: t3.micro
+KeyName: !Ref KeyName
+ImageId: ami-053b0d53c279acc90
 
 ```
-  InstanceType: t3.micro
-  KeyName: !Ref KeyName
-
-  ImageId: ami-053b0d53c279acc90   # Ubuntu 24.04 (us-east-1)
-
   SecurityGroupIds:
     - !Ref InstanceSecurityGroup
 
@@ -119,9 +92,7 @@ Properties:
       apt-get install -y python3 python3-pip python3-venv git
 
       cd /home/ubuntu
-
       git clone https://github.com/uvasds-systems/anomaly-detection.git
-
       cd anomaly-detection
 
       python3 -m venv venv
@@ -136,12 +107,6 @@ Properties:
       nohup venv/bin/fastapi run app.py --host 0.0.0.0 --port 8000 &
 ```
 
-# ----------------------------
-
-# Elastic IP
-
-# ----------------------------
-
 ElasticIP:
 Type: AWS::EC2::EIP
 
@@ -151,22 +116,10 @@ Properties:
 InstanceId: !Ref EC2Instance
 AllocationId: !GetAtt ElasticIP.AllocationId
 
-# ----------------------------
-
-# SNS Topic
-
-# ----------------------------
-
 SNSTopic:
 Type: AWS::SNS::Topic
 Properties:
 TopicName: ds5220-dp1
-
-# ----------------------------
-
-# SNS Subscription
-
-# ----------------------------
 
 SNSSubscription:
 Type: AWS::SNS::Subscription
@@ -174,25 +127,3 @@ Properties:
 TopicArn: !Ref SNSTopic
 Protocol: http
 Endpoint: !Sub http://${ElasticIP}:8000/notify
-
-# ----------------------------
-
-# Bucket Notification
-
-# ----------------------------
-
-BucketNotification:
-Type: AWS::S3::BucketNotification
-Properties:
-Bucket: !Ref DataBucket
-NotificationConfiguration:
-TopicConfigurations:
-- Event: s3:ObjectCreated:*
-Topic: !Ref SNSTopic
-Filter:
-S3Key:
-Rules:
-- Name: prefix
-Value: raw/
-- Name: suffix
-Value: .csv
