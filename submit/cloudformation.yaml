@@ -8,18 +8,51 @@ Parameters:
     Default: ds5220-keypair
 
   MyIP:
-    Description: Your IP for SSH access
+    Description: Your public IP in CIDR form for SSH access (example 1.2.3.4/32)
     Type: String
-    Default: 0.0.0.0/0
+
+  UbuntuAmiId:
+    Description: Ubuntu 24.04 LTS AMI ID for your AWS region
+    Type: AWS::EC2::Image::Id
 
 Resources:
   DataBucket:
     Type: AWS::S3::Bucket
+    Properties:
+      NotificationConfiguration:
+        TopicConfigurations:
+          - Event: s3:ObjectCreated:*
+            Topic: !Ref SNSTopic
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: raw/
+                  - Name: suffix
+                    Value: .csv
 
   SNSTopic:
     Type: AWS::SNS::Topic
     Properties:
       TopicName: ds5220-dp1
+
+  SNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref SNSTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowS3PublishToTopic
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref SNSTopic
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub arn:aws:s3:::${DataBucket}
 
   EC2Role:
     Type: AWS::IAM::Role
@@ -79,7 +112,7 @@ Resources:
     Properties:
       InstanceType: t3.micro
       KeyName: !Ref KeyName
-      ImageId: ami-053b0d53c279acc90
+      ImageId: !Ref UbuntuAmiId
       SecurityGroupIds:
         - !Ref InstanceSecurityGroup
       IamInstanceProfile: !Ref EC2InstanceProfile
@@ -97,13 +130,16 @@ Resources:
           apt-get install -y python3 python3-pip python3-venv git
 
           cd /home/ubuntu
-          git clone https://github.com/arnavjain321-prog/anomaly-detection.git
-          cd anomaly-detection
+
+          if [ ! -d anomaly-detection ]; then
+            git clone https://github.com/arnavjain321-prog/anomaly-detection.git
+          fi
+
+          cd /home/ubuntu/anomaly-detection
 
           python3 -m venv venv
           /home/ubuntu/anomaly-detection/venv/bin/pip install --upgrade pip
-          /home/ubuntu/anomaly-detection/venv/bin/pip install -r requirements.txt
-          /home/ubuntu/anomaly-detection/venv/bin/pip install fastapi uvicorn boto3 pandas scikit-learn requests
+          /home/ubuntu/anomaly-detection/venv/bin/pip install -r /home/ubuntu/anomaly-detection/requirements.txt
 
           echo "BUCKET_NAME=${DataBucket}" >> /etc/environment
           export BUCKET_NAME=${DataBucket}
@@ -117,7 +153,7 @@ Resources:
           User=ubuntu
           WorkingDirectory=/home/ubuntu/anomaly-detection
           Environment=BUCKET_NAME=${DataBucket}
-          ExecStart=/home/ubuntu/anomaly-detection/venv/bin/fastapi run app.py --host 0.0.0.0 --port 8000
+          ExecStart=/home/ubuntu/anomaly-detection/venv/bin/fastapi run /home/ubuntu/anomaly-detection/app.py --host 0.0.0.0 --port 8000
           Restart=always
 
           [Install]
