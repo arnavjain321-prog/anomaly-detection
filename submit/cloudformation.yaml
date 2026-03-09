@@ -1,43 +1,52 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: DS5220 Anomaly Detection Pipeline Core Infrastructure
+Description: DS5220 Data Project 1 - Anomaly Detection Pipeline (us-east-1)
+
+# ── Parameters ────────────────────────────────────────────────────────────────
 
 Parameters:
+
   KeyName:
-    Description: EC2 Key Pair
+    Description: Name of an existing EC2 Key Pair for SSH access
     Type: AWS::EC2::KeyPair::KeyName
     Default: ds5220-keypair
 
   MyIP:
-    Description: Your public IP in CIDR form for SSH access (example 1.2.3.4/32)
+    Description: Your public IP in CIDR form for SSH access (e.g. 206.74.80.226/32)
     Type: String
+    Default: "206.74.80.226/32"
 
   UbuntuAmiId:
-    Description: Ubuntu 24.04 LTS AMI ID for your AWS region
+    Description: Ubuntu 24.04 LTS AMI ID for us-east-1
     Type: AWS::EC2::Image::Id
+    Default: ami-0c7217cdde317cfec  # Ubuntu 24.04 LTS us-east-1 (update if region changes)
+
+# ── Resources ─────────────────────────────────────────────────────────────────
 
 Resources:
+
+  # ── S3 Bucket ───────────────────────────────────────────────────────────────
+  # NOTE: No NotificationConfiguration here — adding it directly would create
+  # a circular dependency with SNSTopic. Instead, a Lambda custom resource
+  # below sets the notification AFTER both the bucket and topic exist.
+
   DataBucket:
     Type: AWS::S3::Bucket
     Properties:
-      NotificationConfiguration:
-        TopicConfigurations:
-          - Event: s3:ObjectCreated:*
-            Topic: !Ref SNSTopic
-            Filter:
-              S3Key:
-                Rules:
-                  - Name: prefix
-                    Value: raw/
-                  - Name: suffix
-                    Value: .csv
+      Tags:
+        - Key: Project
+          Value: ds5220-dp1
+
+  # ── SNS Topic ────────────────────────────────────────────────────────────────
 
   SNSTopic:
     Type: AWS::SNS::Topic
     Properties:
       TopicName: ds5220-dp1
 
+  # Allow S3 to publish to this topic
   SNSTopicPolicy:
     Type: AWS::SNS::TopicPolicy
+    DependsOn: DataBucket
     Properties:
       Topics:
         - !Ref SNSTopic
@@ -52,7 +61,105 @@ Resources:
             Resource: !Ref SNSTopic
             Condition:
               ArnLike:
-                aws:SourceArn: !Sub arn:aws:s3:::${DataBucket}
+                aws:SourceArn: !Sub "arn:aws:s3:::${DataBucket}"
+
+  # SNS HTTP subscription → EC2 /notify endpoint
+  SNSSubscription:
+    Type: AWS::SNS::Subscription
+    DependsOn: EIPAssociation
+    Properties:
+      TopicArn: !Ref SNSTopic
+      Protocol: http
+      Endpoint: !Sub "http://${ElasticIP}:8000/notify"
+
+  # ── Lambda custom resource: sets S3 event notification post-creation ─────────
+  # This breaks the S3 ↔ SNS circular dependency by wiring the notification
+  # only after both resources exist.
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3NotificationAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutBucketNotification
+                  - s3:GetBucketNotification
+                Resource: !GetAtt DataBucket.Arn
+
+  S3NotificationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "ds5220-s3-notif-${AWS::StackName}"
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              s3 = boto3.client("s3")
+              bucket = event["ResourceProperties"]["BucketName"]
+              topic_arn = event["ResourceProperties"]["TopicArn"]
+
+              try:
+                  if event["RequestType"] in ("Create", "Update"):
+                      s3.put_bucket_notification_configuration(
+                          Bucket=bucket,
+                          NotificationConfiguration={
+                              "TopicConfigurations": [
+                                  {
+                                      "TopicArn": topic_arn,
+                                      "Events": ["s3:ObjectCreated:*"],
+                                      "Filter": {
+                                          "Key": {
+                                              "FilterRules": [
+                                                  {"Name": "prefix", "Value": "raw/"},
+                                                  {"Name": "suffix", "Value": ".csv"},
+                                              ]
+                                          }
+                                      },
+                                  }
+                              ]
+                          },
+                      )
+                  elif event["RequestType"] == "Delete":
+                      s3.put_bucket_notification_configuration(
+                          Bucket=bucket,
+                          NotificationConfiguration={}
+                      )
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(f"Error: {e}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)})
+
+  S3NotificationCustomResource:
+    Type: Custom::S3Notification
+    DependsOn:
+      - SNSTopicPolicy
+      - DataBucket
+      - SNSTopic
+    Properties:
+      ServiceToken: !GetAtt S3NotificationLambda.Arn
+      BucketName: !Ref DataBucket
+      TopicArn: !Ref SNSTopic
+
+  # ── IAM Role for EC2 ─────────────────────────────────────────────────────────
 
   EC2Role:
     Type: AWS::IAM::Role
@@ -68,7 +175,7 @@ Resources:
   EC2Policy:
     Type: AWS::IAM::Policy
     Properties:
-      PolicyName: BucketAccess
+      PolicyName: AnomalyBucketFullAccess
       Roles:
         - !Ref EC2Role
       PolicyDocument:
@@ -77,15 +184,16 @@ Resources:
           - Effect: Allow
             Action:
               - s3:ListBucket
+              - s3:GetBucketLocation
             Resource:
-              - !Sub arn:aws:s3:::${DataBucket}
+              - !GetAtt DataBucket.Arn
           - Effect: Allow
             Action:
               - s3:GetObject
               - s3:PutObject
               - s3:DeleteObject
             Resource:
-              - !Sub arn:aws:s3:::${DataBucket}/*
+              - !Sub "${DataBucket.Arn}/*"
 
   EC2InstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -93,10 +201,12 @@ Resources:
       Roles:
         - !Ref EC2Role
 
+  # ── Security Group ────────────────────────────────────────────────────────────
+
   InstanceSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Allow SSH and FastAPI
+      GroupDescription: Allow SSH from my IP and FastAPI port from anywhere
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 22
@@ -106,6 +216,8 @@ Resources:
           FromPort: 8000
           ToPort: 8000
           CidrIp: 0.0.0.0/0
+
+  # ── EC2 Instance ──────────────────────────────────────────────────────────────
 
   EC2Instance:
     Type: AWS::EC2::Instance
@@ -122,28 +234,40 @@ Resources:
             VolumeSize: 16
             VolumeType: gp3
             DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: !Sub "ds5220-instance-${AWS::StackName}"
       UserData:
         Fn::Base64: !Sub |
           #!/bin/bash
           set -e
+
+          # Update and install dependencies
           apt-get update -y
           apt-get install -y python3 python3-pip python3-venv git
 
-          cd /home/ubuntu
+          # Set BUCKET_NAME globally for all future logins and reboots
+          echo "BUCKET_NAME=${DataBucket}" >> /etc/environment
 
-          if [ ! -d anomaly-detection ]; then
-            git clone https://github.com/arnavjain321-prog/anomaly-detection.git
-          fi
+          # Also export immediately for this bootstrap session
+          export BUCKET_NAME=${DataBucket}
+
+          # Clone the forked application
+          cd /home/ubuntu
+          git clone https://github.com/arnavjain321-prog/anomaly-detection.git
 
           cd /home/ubuntu/anomaly-detection
 
+          # Set up Python virtual environment and install dependencies
           python3 -m venv venv
           /home/ubuntu/anomaly-detection/venv/bin/pip install --upgrade pip
           /home/ubuntu/anomaly-detection/venv/bin/pip install -r /home/ubuntu/anomaly-detection/requirements.txt
 
-          echo "BUCKET_NAME=${DataBucket}" >> /etc/environment
-          export BUCKET_NAME=${DataBucket}
+          # Create log directory
+          mkdir -p /var/log/anomaly-detection
+          chown ubuntu:ubuntu /var/log/anomaly-detection
 
+          # Create systemd service for auto-start on reboot
           cat > /etc/systemd/system/anomaly-api.service <<EOF
           [Unit]
           Description=Anomaly Detection FastAPI Service
@@ -155,6 +279,7 @@ Resources:
           Environment=BUCKET_NAME=${DataBucket}
           ExecStart=/home/ubuntu/anomaly-detection/venv/bin/fastapi run /home/ubuntu/anomaly-detection/app.py --host 0.0.0.0 --port 8000
           Restart=always
+          RestartSec=5
 
           [Install]
           WantedBy=multi-user.target
@@ -163,6 +288,8 @@ Resources:
           systemctl daemon-reload
           systemctl enable anomaly-api.service
           systemctl start anomaly-api.service
+
+  # ── Elastic IP ────────────────────────────────────────────────────────────────
 
   ElasticIP:
     Type: AWS::EC2::EIP
@@ -175,17 +302,10 @@ Resources:
       InstanceId: !Ref EC2Instance
       AllocationId: !GetAtt ElasticIP.AllocationId
 
-  SNSSubscription:
-    Type: AWS::SNS::Subscription
-    DependsOn:
-      - EIPAssociation
-      - EC2Instance
-    Properties:
-      TopicArn: !Ref SNSTopic
-      Protocol: http
-      Endpoint: !Sub "http://${ElasticIP}:8000/notify"
+# ── Outputs ───────────────────────────────────────────────────────────────────
 
 Outputs:
+
   BucketName:
     Description: S3 bucket used by the anomaly pipeline
     Value: !Ref DataBucket
@@ -194,10 +314,22 @@ Outputs:
     Description: Public Elastic IP of the EC2 instance
     Value: !Ref ElasticIP
 
+  APIEndpoint:
+    Description: Base URL for the FastAPI service
+    Value: !Sub "http://${ElasticIP}:8000"
+
+  HealthCheckURL:
+    Description: Health check endpoint — confirm the app is running
+    Value: !Sub "http://${ElasticIP}:8000/health"
+
+  NotifyEndpoint:
+    Description: SNS subscription endpoint
+    Value: !Sub "http://${ElasticIP}:8000/notify"
+
+  SNSTopicARN:
+    Description: ARN of the SNS topic ds5220-dp1
+    Value: !Ref SNSTopic
+
   InstanceId:
     Description: EC2 instance ID
     Value: !Ref EC2Instance
-
-  TopicArn:
-    Description: SNS topic ARN
-    Value: !Ref SNSTopic
